@@ -31,6 +31,15 @@ except ImportError:
 # ----- Width helpers --------------------------------------------------------
 
 def vwidth(s: str) -> int:
+    """Визуальная ширина строки в терминальных колонках.
+
+    Учитывает CJK-символы и эмодзи через ``wcwidth``, если он установлен.
+    Иначе возвращает обычную длину строки (``len``) — приблизительно, но
+    достаточно для ASCII/кириллицы.
+
+    :param s: Произвольная строка.
+    :return: Количество визуальных колонок, занимаемых строкой.
+    """
     if _wcswidth is not None:
         w = _wcswidth(s)
         if w >= 0:
@@ -39,6 +48,17 @@ def vwidth(s: str) -> int:
 
 
 def vpad(s: str, width: int, truncate: bool = True) -> str:
+    """Добивает строку пробелами до заданной визуальной ширины.
+
+    Если строка длиннее ``width`` и ``truncate=True``, обрезает её и
+    дописывает символ многоточия ``…``. Если ``truncate=False`` — возвращает
+    строку без изменений (без обрезки и без паддинга).
+
+    :param s: Исходная строка.
+    :param width: Целевая визуальная ширина в колонках.
+    :param truncate: Разрешать ли обрезку слишком длинных строк.
+    :return: Строка фиксированной визуальной ширины.
+    """
     w = vwidth(s)
     if w <= width:
         return s + " " * (width - w)
@@ -62,6 +82,15 @@ def vpad(s: str, width: int, truncate: bool = True) -> str:
 # ----- Config ---------------------------------------------------------------
 
 def load_env(path: Path) -> None:
+    """Загружает переменные окружения из ``.env``-файла.
+
+    Простейший парсер: строки вида ``KEY=VALUE``, комментарии (``#``) и
+    пустые строки игнорируются. Кавычки вокруг значения снимаются. Уже
+    установленные в окружении переменные **не перезаписываются**
+    (используется ``setdefault``).
+
+    :param path: Путь к ``.env``-файлу. Если файла нет — функция тихо выходит.
+    """
     if not path.exists():
         return
     for line in path.read_text().splitlines():
@@ -75,6 +104,14 @@ def load_env(path: Path) -> None:
 # ----- CLI ------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    """Разбирает аргументы командной строки.
+
+    Конфигурирует ``argparse`` с описанием на русском, набором флагов
+    (``--type``, ``--output``, ``--format``, ``--no-current``, ``--no-left``,
+    ``--session``, ``--poll``, ``--lookup``) и примерами использования.
+
+    :return: ``argparse.Namespace`` с заполненными полями.
+    """
     p = argparse.ArgumentParser(
         prog="list_channels.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -150,6 +187,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_format(args) -> str:
+    """Определяет фактический формат вывода.
+
+    Если ``--format`` задан явно (не ``auto``) — возвращает его. Иначе
+    угадывает формат по расширению ``--output`` (``.pdf`` / ``.md`` /
+    ``.markdown`` / ``.xlsx``); если ничего не подошло — ``txt``.
+
+    :param args: Результат ``parse_args``.
+    :return: Один из ``"txt" | "pdf" | "md" | "xlsx"``.
+    """
     if args.format != "auto":
         return args.format
     if args.output:
@@ -166,10 +212,24 @@ def resolve_format(args) -> str:
 # ----- Record helpers -------------------------------------------------------
 
 def type_of(e) -> str:
+    """Возвращает тип сущности Telegram: ``channel`` или ``group``.
+
+    Broadcast-канал в Telegram имеет флаг ``broadcast=True``; супергруппа —
+    ``broadcast=False`` (в Telethon это всё ``Channel``-объекты).
+
+    :param e: Telethon-сущность ``Channel``.
+    :return: ``"channel"`` для broadcast-канала, иначе ``"group"``.
+    """
     return "channel" if getattr(e, "broadcast", False) else "group"
 
 
 def keep(entity, type_filter: str) -> bool:
+    """Проверяет, проходит ли сущность через фильтр по типу.
+
+    :param entity: Telethon-сущность ``Channel``.
+    :param type_filter: ``"all"`` / ``"channels"`` / ``"groups"``.
+    :return: ``True``, если сущность нужно оставить в выборке.
+    """
     t = type_of(entity)
     if type_filter == "all":
         return True
@@ -181,6 +241,13 @@ def keep(entity, type_filter: str) -> bool:
 
 
 def to_record(entity) -> dict:
+    """Конвертирует Telethon-сущность в плоскую запись для отчёта.
+
+    :param entity: Telethon-сущность ``Channel``.
+    :return: Словарь с ключами ``id``, ``title``, ``username``, ``link``,
+        ``type``. Поле ``username`` начинается с ``@`` либо равно ``"-"``,
+        ``link`` пустой, если у сущности нет публичного юзернейма.
+    """
     uname = getattr(entity, "username", None)
     return {
         "id": entity.id,
@@ -194,6 +261,17 @@ def to_record(entity) -> dict:
 # ----- Telegram fetchers ----------------------------------------------------
 
 async def fetch_current(client, type_filter: str, log) -> list[dict]:
+    """Загружает активные подписки пользователя.
+
+    Обходит все диалоги (``iter_dialogs``), оставляет только ``Channel``
+    (broadcast-каналы и супергруппы), применяет фильтр ``type_filter`` и
+    дедуплицирует по ``id``.
+
+    :param client: Авторизованный ``TelegramClient``.
+    :param type_filter: ``"all"`` / ``"channels"`` / ``"groups"``.
+    :param log: Колбэк для прогресс-логов (печатает в ``stderr``).
+    :return: Список записей в формате ``to_record``.
+    """
     out = []
     seen_ids: set[int] = set()
     async for d in client.iter_dialogs():
@@ -211,6 +289,28 @@ async def fetch_current(client, type_filter: str, log) -> list[dict]:
 
 
 async def fetch_left(client, type_filter: str, exclude_ids: set[int], poll: int, log) -> list[dict]:
+    """Загружает покинутые каналы через Telegram Takeout API.
+
+    Telegram отдаёт список ``GetLeftChannelsRequest`` только в рамках
+    Takeout-сессии, которую пользователь должен подтвердить в официальном
+    клиенте (всплывающее уведомление «Запрос на экспорт данных»). Метод:
+
+    1. Сбрасывает старый ``takeout_id`` в сессии Telethon.
+    2. В цикле инициирует ``InitTakeoutSessionRequest``, ловя
+       ``TakeoutInitDelayError`` и засыпая на ``poll`` секунд между
+       попытками — пока пользователь не подтвердит запрос.
+    3. Постранично выгружает покинутые каналы через
+       ``InvokeWithTakeoutRequest(GetLeftChannelsRequest)``.
+    4. В ``finally`` корректно закрывает Takeout-сессию.
+
+    :param client: Авторизованный ``TelegramClient``.
+    :param type_filter: ``"all"`` / ``"channels"`` / ``"groups"``.
+    :param exclude_ids: id, которые уже есть в активных подписках —
+        исключаются, чтобы не было дублей в отчёте.
+    :param poll: Интервал ретраев инициации Takeout, секунды.
+    :param log: Колбэк для прогресс-логов.
+    :return: Список записей покинутых каналов в формате ``to_record``.
+    """
     log("  сбрасываю прежний takeout_id (если был)")
     client.session.takeout_id = None
     client.session.save()
@@ -282,6 +382,19 @@ async def fetch_left(client, type_filter: str, exclude_ids: set[int], poll: int,
 
 
 async def lookup_records(client, ids: list[int], log) -> list[dict]:
+    """Находит каналы по их числовым id и собирает подробности.
+
+    Для каждого id вызывает ``get_entity(PeerChannel(id))``, затем
+    ``GetFullChannelRequest`` для извлечения описания (``about``) и
+    числа участников (``participants_count``). Если канал недоступен —
+    запись помечается полем ``error`` с текстом исключения.
+
+    :param client: Авторизованный ``TelegramClient``.
+    :param ids: Список числовых id каналов.
+    :param log: Колбэк для прогресс-логов.
+    :return: Список словарей с ключами ``id``, ``type``, ``title``,
+        ``username``, ``link``, ``about``, ``participants``, ``error``.
+    """
     out = []
     for cid in ids:
         log(f"  ищу id={cid}...")
@@ -311,6 +424,16 @@ async def lookup_records(client, ids: list[int], log) -> list[dict]:
 # ----- Text renderer --------------------------------------------------------
 
 def banner_lines(args) -> list[str]:
+    """Формирует строки шапки текстового отчёта.
+
+    Использует псевдографические рамки (``╔═╗║╠╣╚╝``) и выравнивает
+    содержимое через ``vpad``, чтобы рамка оставалась ровной даже при
+    кириллических значениях.
+
+    :param args: Результат ``parse_args`` (используются ``type``,
+        ``no_current``, ``no_left``).
+    :return: Список строк баннера, готовый к печати.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     width = 64
     L = []
@@ -330,6 +453,15 @@ def banner_lines(args) -> list[str]:
 
 
 def render_text_section(out, title: str, items: list[dict]) -> None:
+    """Печатает секцию текстового отчёта (заголовок + таблица).
+
+    Сортирует записи по ``(type, title.lower())``, динамически подбирает
+    ширину колонок ``title`` и ``username`` под фактическое содержимое.
+
+    :param out: Файлоподобный объект для записи (``stdout`` или открытый файл).
+    :param title: Заголовок секции (без счётчика — он добавится сам).
+    :param items: Список записей в формате ``to_record``.
+    """
     header = f"━━━ {title}  ({len(items)}) "
     print(header + "━" * max(0, 100 - vwidth(header)), file=out)
     if not items:
@@ -352,6 +484,15 @@ def render_text_section(out, title: str, items: list[dict]) -> None:
 
 
 def render_text_lookup(out, items: list[dict]) -> None:
+    """Печатает результат режима ``--lookup`` в текстовом виде.
+
+    Каждая запись выводится блоком «ключ : значение». Если запись
+    содержит поле ``error`` — печатает строку с ошибкой и пропускает
+    остальные поля.
+
+    :param out: Файлоподобный объект для записи.
+    :param items: Результат ``lookup_records``.
+    """
     print("━━━ Поиск по id ━━━".ljust(80, "━"), file=out)
     print(file=out)
     for it in items:
@@ -372,6 +513,18 @@ def render_text_lookup(out, items: list[dict]) -> None:
 
 
 def write_text(path: Path | None, args, current, left, lookup) -> None:
+    """Пишет отчёт в текстовом формате (TXT).
+
+    Если ``path is None`` — пишет в ``sys.stdout``. Иначе открывает файл
+    в UTF-8 на запись. В режиме ``--lookup`` печатается только результат
+    поиска без секций активных/покинутых.
+
+    :param path: Целевой путь либо ``None`` для stdout.
+    :param args: Результат ``parse_args``.
+    :param current: Записи активных подписок.
+    :param left: Записи покинутых каналов.
+    :param lookup: Результат ``--lookup`` либо ``None``.
+    """
     @contextmanager
     def _open():
         if path is None:
@@ -405,6 +558,15 @@ def write_text(path: Path | None, args, current, left, lookup) -> None:
 # ----- PDF renderer ---------------------------------------------------------
 
 def _register_mono_font() -> str:
+    """Регистрирует моноширинный шрифт с поддержкой кириллицы для PDF.
+
+    Перебирает кандидатов (Menlo на macOS, Courier New, DejaVu Sans Mono,
+    Consolas) и регистрирует первый существующий под именем ``MonoCyr``.
+    Если ничего не нашлось — возвращает встроенный ``Courier`` (кириллицу
+    он не отрисует, но скрипт не упадёт).
+
+    :return: Имя зарегистрированного шрифта для использования в reportlab.
+    """
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     candidates = [
@@ -429,10 +591,32 @@ def _register_mono_font() -> str:
 
 
 def _esc(s: str) -> str:
+    """XML-экранирование + замена пробелов на ``&nbsp;``.
+
+    Используется внутри reportlab-параграфов, чтобы при переносе строк
+    пробелы не схлопывались, а спецсимволы (``<``, ``>``, ``&``) не
+    ломали разметку.
+
+    :param s: Произвольный текст.
+    :return: Безопасная для вставки в HTML-параграф reportlab строка.
+    """
     return xml_escape(s).replace(" ", "&nbsp;")
 
 
 def write_pdf(path: Path, args, current, left, lookup) -> None:
+    """Пишет отчёт в PDF (альбомный A4, кликабельные ссылки).
+
+    Использует ``reportlab.platypus`` для построения многостраничного
+    документа с таблицами, чередованием цвета строк и гиперссылками в
+    колонке ``link``. Шрифт подбирается в ``_register_mono_font`` — для
+    корректной отрисовки кириллицы.
+
+    :param path: Путь к выходному PDF (формат — landscape A4).
+    :param args: Результат ``parse_args`` (используется для шапки и флагов).
+    :param current: Записи активных подписок.
+    :param left: Записи покинутых каналов.
+    :param lookup: Результат ``--lookup`` либо ``None``.
+    """
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -494,6 +678,11 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
     ])
 
     def make_row(it: dict) -> list:
+        """Собирает одну строку таблицы из записи ``to_record``.
+
+        :param it: Запись канала/группы.
+        :return: Список ``Paragraph``-ов в порядке колонок таблицы.
+        """
         link_para = (
             Paragraph(f'<a href="{xml_escape(it["link"])}">{xml_escape(it["link"])}</a>',
                       body_link)
@@ -508,6 +697,11 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
         ]
 
     def section(title_text: str, items: list[dict]):
+        """Добавляет в PDF-историю секцию: заголовок и таблицу записей.
+
+        :param title_text: Заголовок секции (без счётчика).
+        :param items: Список записей. Сортируется по типу и заголовку.
+        """
         story.append(Paragraph(xml_escape(f"━━━ {title_text}  ({len(items)})"), head))
         if not items:
             story.append(Paragraph("(пусто)", body))
@@ -560,16 +754,38 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
 # ----- Markdown renderer ----------------------------------------------------
 
 def _md_escape(s: str) -> str:
+    """Экранирует значение для ячейки Markdown-таблицы.
+
+    Заменяет ``|`` на ``\\|`` (иначе ломается разметка таблицы) и
+    переводит переносы строк в пробелы.
+
+    :param s: Произвольная строка (или ``None``).
+    :return: Безопасное содержимое одной ячейки таблицы.
+    """
     return (s or "").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 
 def _md_link(it: dict) -> str:
+    """Формирует Markdown-ссылку для записи или ``—``, если её нет.
+
+    :param it: Запись ``to_record``.
+    :return: Строка ``[url](url)`` либо ``"—"``.
+    """
     if it["link"]:
         return f"[{_md_escape(it['link'])}]({it['link']})"
     return "—"
 
 
 def _md_section(out, title: str, items: list[dict]) -> None:
+    """Печатает одну секцию Markdown-отчёта.
+
+    Заголовок второго уровня + таблица с пятью колонками. Записи
+    сортируются по ``(type, title.lower())``.
+
+    :param out: Файлоподобный объект для записи.
+    :param title: Заголовок секции.
+    :param items: Список записей ``to_record``.
+    """
     print(f"## {title}  ({len(items)})\n", file=out)
     if not items:
         print("_(пусто)_\n", file=out)
@@ -590,6 +806,18 @@ def _md_section(out, title: str, items: list[dict]) -> None:
 
 
 def write_md(path: Path, args, current, left, lookup) -> None:
+    """Пишет отчёт в Markdown.
+
+    Шапка с метаданными, далее — секции активных и/или покинутых каналов
+    либо одна таблица результатов ``--lookup``. В конце — итоговая
+    строка «Всего записей».
+
+    :param path: Целевой ``.md``-файл (UTF-8).
+    :param args: Результат ``parse_args``.
+    :param current: Записи активных подписок.
+    :param left: Записи покинутых каналов.
+    :param lookup: Результат ``--lookup`` либо ``None``.
+    """
     with path.open("w", encoding="utf-8") as out:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("# Telegram: список каналов и групп\n", file=out)
@@ -634,12 +862,32 @@ def write_md(path: Path, args, current, left, lookup) -> None:
 # ----- XLSX renderer --------------------------------------------------------
 
 def _xlsx_autofit(ws, max_widths: dict[int, int]) -> None:
+    """Подгоняет ширину колонок XLSX под максимальную длину содержимого.
+
+    Ширина зажимается в диапазоне ``[8, 80]`` плюс небольшой запас (``+2``),
+    чтобы не было ни «слипшихся», ни чрезмерно растянутых колонок.
+
+    :param ws: Лист openpyxl.
+    :param max_widths: Словарь ``номер_колонки → максимальная длина строки``.
+    """
     from openpyxl.utils import get_column_letter
     for col_idx, width in max_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width + 2, 8), 80)
 
 
 def _xlsx_write_table(ws, headers: list[str], rows: list[list], link_col: int | None) -> None:
+    """Заполняет лист таблицей: шапка, строки, стили, гиперссылки.
+
+    Шапка — синий фон с белым текстом, чётные строки — лёгкая «зебра»,
+    тонкие серые границы у всех ячеек. Если задан ``link_col`` —
+    значения этой колонки, начинающиеся с ``http``, превращаются в
+    кликабельные гиперссылки. Первая строка фиксируется (``freeze_panes``).
+
+    :param ws: Лист openpyxl.
+    :param headers: Заголовки колонок.
+    :param rows: Двумерный список значений (без шапки).
+    :param link_col: Номер колонки с URL (1-based) либо ``None``.
+    """
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     header_font = Font(name="Menlo", bold=True, color="FFFFFF", size=11)
@@ -680,6 +928,23 @@ def _xlsx_write_table(ws, headers: list[str], rows: list[list], link_col: int | 
 
 
 def write_xlsx(path: Path, args, current, left, lookup) -> None:
+    """Пишет отчёт в Excel-книгу (.xlsx).
+
+    Структура книги:
+
+    - ``Сводка`` — метаданные и итоговые счётчики.
+    - ``Активные`` — таблица активных подписок (если не ``--no-current``).
+    - ``Покинутые`` — таблица покинутых каналов (если не ``--no-left``).
+    - ``Поиск`` — результаты ``--lookup`` (вместо двух предыдущих листов).
+
+    Используется openpyxl. Ссылки в колонке ``ссылка`` — кликабельные.
+
+    :param path: Целевой ``.xlsx``-файл.
+    :param args: Результат ``parse_args``.
+    :param current: Записи активных подписок.
+    :param left: Записи покинутых каналов.
+    :param lookup: Результат ``--lookup`` либо ``None``.
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment
 
@@ -704,6 +969,11 @@ def write_xlsx(path: Path, args, current, left, lookup) -> None:
     info.column_dimensions["B"].width = 40
 
     def section_sheet(name: str, items: list[dict]):
+        """Создаёт отдельный лист с одной таблицей записей.
+
+        :param name: Имя листа в книге Excel.
+        :param items: Список записей ``to_record``.
+        """
         ws = wb.create_sheet(name)
         items.sort(key=lambda x: (x["type"], x["title"].lower()))
         rows = [
@@ -748,12 +1018,34 @@ def write_xlsx(path: Path, args, current, left, lookup) -> None:
 # ----- Main -----------------------------------------------------------------
 
 async def run(args) -> None:
+    """Главный сценарий: подключение, загрузка данных, запись отчёта.
+
+    Шаги:
+
+    1. Определяет формат вывода и валидирует наличие ``--output`` для
+       бинарных форматов (PDF/MD/XLSX).
+    2. Поднимает ``TelegramClient`` с указанной сессией. При первом
+       запуске Telethon сам спросит телефон, код и пароль 2FA.
+    3. В зависимости от флагов: либо ``--lookup``, либо обычный режим с
+       загрузкой активных и/или покинутых каналов.
+    4. Гарантированно отключается от Telegram в ``finally``.
+    5. Делегирует запись соответствующему ``write_*``.
+
+    :param args: Результат ``parse_args``.
+    """
     fmt = resolve_format(args)
     if fmt in ("pdf", "md", "xlsx") and args.output is None:
         print(f"ОШИБКА: для формата {fmt} нужен --output PATH.", file=sys.stderr)
         sys.exit(2)
 
     def log(msg: str) -> None:
+        """Печатает прогресс-сообщение в stderr с принудительным flush.
+
+        Stderr используется, чтобы не смешиваться с отчётом, который
+        может уходить в stdout.
+
+        :param msg: Текст сообщения.
+        """
         print(msg, file=sys.stderr, flush=True)
 
     log(f"→ Подключаюсь, сессия={args.session!r}...")
@@ -796,6 +1088,14 @@ async def run(args) -> None:
 
 
 def main() -> None:
+    """Точка входа CLI.
+
+    Разбирает аргументы, подгружает ``.env`` рядом со скриптом, проверяет
+    наличие ``API_ID`` / ``API_HASH``, выставляет глобальные переменные
+    для Telethon и запускает асинхронный ``run`` через ``asyncio.run``.
+
+    Завершается с кодом ``2``, если переменные окружения не заданы.
+    """
     args = parse_args()
     load_env(Path(__file__).parent / ".env")
     if "API_ID" not in os.environ or "API_HASH" not in os.environ:
