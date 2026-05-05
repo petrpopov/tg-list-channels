@@ -1,0 +1,27 @@
+# secrets / sessions
+.env
+*.session
+*.session-journal
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.eggs/
+build/
+dist/
+
+# generated reports
+report.md
+report.pdf
+report.xlsx
+report.txt
+list.pdf
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
