@@ -13,7 +13,11 @@ from contextlib import contextmanager
 from xml.sax.saxutils import escape as xml_escape
 
 from telethon import TelegramClient
-from telethon.tl.functions.channels import GetLeftChannelsRequest, GetFullChannelRequest
+from telethon.tl.functions.channels import (
+    GetLeftChannelsRequest,
+    GetFullChannelRequest,
+    GetParticipantRequest,
+)
 from telethon.tl.functions.account import (
     FinishTakeoutSessionRequest,
     InitTakeoutSessionRequest,
@@ -176,6 +180,18 @@ def parse_args() -> argparse.Namespace:
         help="Интервал ретраев Takeout-инициации в секундах (по умолчанию: 15).",
     )
     p.add_argument(
+        "--with-joined",
+        action="store_true",
+        help="Дозапросить дату вступления (joined_at) для активных подписок. "
+             "Делает +1 RPC на канал — медленно при сотнях каналов.",
+    )
+    p.add_argument(
+        "--with-activity",
+        action="store_true",
+        help="Дозапросить дату последнего сообщения (last_message_at). "
+             "Делает +1 RPC на канал — медленно при сотнях каналов.",
+    )
+    p.add_argument(
         "--lookup",
         type=int,
         nargs="+",
@@ -240,21 +256,52 @@ def keep(entity, type_filter: str) -> bool:
     return False
 
 
+def _fmt_date(d) -> str:
+    """Форматирует ``datetime`` как ``YYYY-MM-DD`` или возвращает ``""``.
+
+    :param d: ``datetime`` или ``None``.
+    :return: Строка даты или пустая строка.
+    """
+    if d is None:
+        return ""
+    try:
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def to_record(entity) -> dict:
     """Конвертирует Telethon-сущность в плоскую запись для отчёта.
 
     :param entity: Telethon-сущность ``Channel``.
     :return: Словарь с ключами ``id``, ``title``, ``username``, ``link``,
-        ``type``. Поле ``username`` начинается с ``@`` либо равно ``"-"``,
-        ``link`` пустой, если у сущности нет публичного юзернейма.
+        ``type``, ``created_at``, ``members``, ``flags``, ``joined_at``,
+        ``last_message_at``. ``flags`` — строка через запятую из набора
+        ``verified``/``scam``/``fake``/``restricted``. ``joined_at`` и
+        ``last_message_at`` заполняются только при флагах
+        ``--with-joined``/``--with-activity``.
     """
     uname = getattr(entity, "username", None)
+    flags = []
+    if getattr(entity, "verified", False):
+        flags.append("verified")
+    if getattr(entity, "scam", False):
+        flags.append("scam")
+    if getattr(entity, "fake", False):
+        flags.append("fake")
+    if getattr(entity, "restricted", False):
+        flags.append("restricted")
     return {
         "id": entity.id,
         "title": getattr(entity, "title", "") or "",
         "username": f"@{uname}" if uname else "-",
         "link": f"https://t.me/{uname}" if uname else "",
         "type": type_of(entity),
+        "created_at": _fmt_date(getattr(entity, "date", None)),
+        "members": getattr(entity, "participants_count", None),
+        "flags": ",".join(flags),
+        "joined_at": "",
+        "last_message_at": "",
     }
 
 
@@ -381,26 +428,80 @@ async def fetch_left(client, type_filter: str, exclude_ids: set[int], poll: int,
     return out
 
 
-async def lookup_records(client, ids: list[int], log) -> list[dict]:
+async def enrich_joined(client, items: list[dict], log) -> None:
+    """Дозаполняет ``joined_at`` для каждой записи.
+
+    Использует ``GetParticipantRequest(channel, 'me')`` →
+    ``ChannelParticipantSelf.date``. Стоит +1 RPC на канал. При ошибке
+    (нет доступа, флуд, удалён) поле остаётся пустым, инцидент логируется.
+
+    :param client: Авторизованный ``TelegramClient``.
+    :param items: Список записей ``to_record``; модифицируется in-place.
+    :param log: Колбэк для прогресс-логов.
+    """
+    for it in items:
+        try:
+            ch = await client.get_input_entity(PeerChannel(it["id"]))
+            res = await client(GetParticipantRequest(channel=ch, participant="me"))
+            d = getattr(res.participant, "date", None)
+            it["joined_at"] = _fmt_date(d)
+        except Exception as ex:
+            log(f"  предупреждение: joined id={it['id']}: {ex}")
+
+
+async def enrich_activity(client, items: list[dict], log) -> None:
+    """Дозаполняет ``last_message_at`` (дата последнего сообщения).
+
+    Берёт первое сообщение через ``iter_messages(limit=1)``. Стоит +1 RPC
+    на канал. Для канала без сообщений или при ошибке поле остаётся пустым.
+
+    :param client: Авторизованный ``TelegramClient``.
+    :param items: Список записей ``to_record``; модифицируется in-place.
+    :param log: Колбэк для прогресс-логов.
+    """
+    for it in items:
+        try:
+            ch = await client.get_input_entity(PeerChannel(it["id"]))
+            async for msg in client.iter_messages(ch, limit=1):
+                if msg and msg.date:
+                    it["last_message_at"] = _fmt_date(msg.date)
+                break
+        except Exception as ex:
+            log(f"  предупреждение: activity id={it['id']}: {ex}")
+
+
+async def lookup_records(
+    client,
+    ids: list[int],
+    log,
+    with_joined: bool = False,
+    with_activity: bool = False,
+) -> list[dict]:
     """Находит каналы по их числовым id и собирает подробности.
 
     Для каждого id вызывает ``get_entity(PeerChannel(id))``, затем
     ``GetFullChannelRequest`` для извлечения описания (``about``) и
-    числа участников (``participants_count``). Если канал недоступен —
-    запись помечается полем ``error`` с текстом исключения.
+    точного числа участников (``participants``). Дополнительно при
+    флагах ``with_joined``/``with_activity`` дозаполняет ``joined_at``
+    и ``last_message_at``. Если канал недоступен — запись помечается
+    полем ``error`` с текстом исключения.
 
     :param client: Авторизованный ``TelegramClient``.
     :param ids: Список числовых id каналов.
     :param log: Колбэк для прогресс-логов.
-    :return: Список словарей с ключами ``id``, ``type``, ``title``,
-        ``username``, ``link``, ``about``, ``participants``, ``error``.
+    :param with_joined: Запрашивать дату вступления.
+    :param with_activity: Запрашивать дату последнего сообщения.
+    :return: Список словарей с ключами ``to_record`` + ``about``,
+        ``participants``, ``error``.
     """
     out = []
     for cid in ids:
         log(f"  ищу id={cid}...")
         rec = {
             "id": cid, "title": "", "username": "-", "link": "",
-            "type": "?", "about": "", "participants": None, "error": None,
+            "type": "?", "created_at": "", "members": None, "flags": "",
+            "joined_at": "", "last_message_at": "",
+            "about": "", "participants": None, "error": None,
         }
         try:
             entity = await client.get_entity(PeerChannel(cid))
@@ -415,8 +516,14 @@ async def lookup_records(client, ids: list[int], log) -> list[dict]:
             full = await client(GetFullChannelRequest(entity))
             rec["about"] = (full.full_chat.about or "").strip()
             rec["participants"] = getattr(full.full_chat, "participants_count", None)
+            if rec["members"] is None:
+                rec["members"] = rec["participants"]
         except Exception as ex:
             log(f"  предупреждение: GetFullChannel id={cid}: {ex}")
+        if with_joined:
+            await enrich_joined(client, [rec], log)
+        if with_activity:
+            await enrich_activity(client, [rec], log)
         out.append(rec)
     return out
 
@@ -452,11 +559,37 @@ def banner_lines(args) -> list[str]:
     return L
 
 
+def _details_str(it: dict) -> str:
+    """Собирает компактный «хвост» с метаданными канала.
+
+    Включает только непустые поля: ``created``, ``members``, ``flags``,
+    ``joined``, ``last``. Используется в текстовом и markdown-отчётах,
+    чтобы не раздувать основные таблицы.
+
+    :param it: Запись ``to_record``.
+    :return: Строка вида ``created=… members=… flags=… joined=… last=…``.
+    """
+    parts = []
+    if it.get("created_at"):
+        parts.append(f"created={it['created_at']}")
+    if it.get("members") is not None:
+        parts.append(f"members={it['members']}")
+    if it.get("flags"):
+        parts.append(f"flags={it['flags']}")
+    if it.get("joined_at"):
+        parts.append(f"joined={it['joined_at']}")
+    if it.get("last_message_at"):
+        parts.append(f"last={it['last_message_at']}")
+    return " ".join(parts)
+
+
 def render_text_section(out, title: str, items: list[dict]) -> None:
     """Печатает секцию текстового отчёта (заголовок + таблица).
 
     Сортирует записи по ``(type, title.lower())``, динамически подбирает
     ширину колонок ``title`` и ``username`` под фактическое содержимое.
+    После основной строки печатается отступленный «хвост» с метаданными
+    (created/members/flags/joined/last), если хоть одно поле непустое.
 
     :param out: Файлоподобный объект для записи (``stdout`` или открытый файл).
     :param title: Заголовок секции (без счётчика — он добавится сам).
@@ -480,6 +613,9 @@ def render_text_section(out, title: str, items: list[dict]) -> None:
             f"{vpad(it['username'], uname_w)}  id={it['id']:<14}  {link}",
             file=out,
         )
+        details = _details_str(it)
+        if details:
+            print(f"      {details}", file=out)
     print(file=out)
 
 
@@ -505,8 +641,18 @@ def render_text_lookup(out, items: list[dict]) -> None:
         print(f"  название    : {it['title']}", file=out)
         print(f"  @username   : {it['username']}", file=out)
         print(f"  ссылка      : {it['link']}", file=out)
+        if it.get("created_at"):
+            print(f"  создан      : {it['created_at']}", file=out)
         if it.get("participants") is not None:
             print(f"  участников  : {it['participants']}", file=out)
+        elif it.get("members") is not None:
+            print(f"  участников  : {it['members']}", file=out)
+        if it.get("flags"):
+            print(f"  флаги       : {it['flags']}", file=out)
+        if it.get("joined_at"):
+            print(f"  вступил     : {it['joined_at']}", file=out)
+        if it.get("last_message_at"):
+            print(f"  посл. сообщ.: {it['last_message_at']}", file=out)
         if it.get("about"):
             print(f"  описание    : {it['about']}", file=out)
         print(file=out)
@@ -654,11 +800,12 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
 
     page_w = landscape(A4)[0] - 20 * mm
     col_widths = [
-        18 * mm,   # type
-        90 * mm,   # title
-        40 * mm,   # username
-        28 * mm,   # id
-        page_w - (18 + 90 + 40 + 28) * mm,  # link (rest)
+        16 * mm,   # type
+        70 * mm,   # title
+        34 * mm,   # username
+        24 * mm,   # id
+        55 * mm,   # details (created/members/flags/joined/last)
+        page_w - (16 + 70 + 34 + 24 + 55) * mm,  # link (rest)
     ]
 
     table_style = TableStyle([
@@ -688,11 +835,24 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
                       body_link)
             if it["link"] else Paragraph("-", body)
         )
+        details_lines = []
+        if it.get("created_at"):
+            details_lines.append(f"created: {it['created_at']}")
+        if it.get("members") is not None:
+            details_lines.append(f"members: {it['members']}")
+        if it.get("flags"):
+            details_lines.append(f"flags: {it['flags']}")
+        if it.get("joined_at"):
+            details_lines.append(f"joined: {it['joined_at']}")
+        if it.get("last_message_at"):
+            details_lines.append(f"last: {it['last_message_at']}")
+        details_html = "<br/>".join(_esc(s) for s in details_lines) or "-"
         return [
             Paragraph(xml_escape(f"[{it['type']}]"), body),
             Paragraph(xml_escape(it["title"]), body),
             Paragraph(xml_escape(it["username"]), body),
             Paragraph(f"id={it['id']}", body),
+            Paragraph(details_html, body),
             link_para,
         ]
 
@@ -707,7 +867,7 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
             story.append(Paragraph("(пусто)", body))
             return
         items.sort(key=lambda x: (x["type"], x["title"].lower()))
-        rows = [["тип", "название", "@username", "id", "ссылка"]]
+        rows = [["тип", "название", "@username", "id", "детали", "ссылка"]]
         for it in items:
             rows.append(make_row(it))
         t = Table(rows, colWidths=col_widths, repeatRows=1)
@@ -732,8 +892,19 @@ def write_pdf(path: Path, args, current, left, lookup) -> None:
                 f"@username&nbsp;&nbsp;&nbsp;:&nbsp;{_esc(it['username'])}",
                 f"ссылка&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;{link_html}",
             ]
-            if it.get("participants") is not None:
-                block.append(f"участников&nbsp;&nbsp;:&nbsp;{it['participants']}")
+            if it.get("created_at"):
+                block.append(f"создан&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;{_esc(it['created_at'])}")
+            participants = it.get("participants")
+            if participants is None:
+                participants = it.get("members")
+            if participants is not None:
+                block.append(f"участников&nbsp;&nbsp;:&nbsp;{participants}")
+            if it.get("flags"):
+                block.append(f"флаги&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;{_esc(it['flags'])}")
+            if it.get("joined_at"):
+                block.append(f"вступил&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;{_esc(it['joined_at'])}")
+            if it.get("last_message_at"):
+                block.append(f"посл.&nbsp;сообщ.:&nbsp;{_esc(it['last_message_at'])}")
             if it.get("about"):
                 block.append(f"описание&nbsp;&nbsp;&nbsp;&nbsp;:&nbsp;{_esc(it['about'])}")
             for line in block:
@@ -790,18 +961,36 @@ def _md_section(out, title: str, items: list[dict]) -> None:
     if not items:
         print("_(пусто)_\n", file=out)
         return
-    print("| тип | название | @username | id | ссылка |", file=out)
-    print("|-----|----------|-----------|----|--------|", file=out)
+    has_joined = any(i.get("joined_at") for i in items)
+    has_activity = any(i.get("last_message_at") for i in items)
+    headers = ["тип", "название", "@username", "id", "создан", "участников", "флаги"]
+    if has_joined:
+        headers.append("вступил")
+    if has_activity:
+        headers.append("посл. сообщ.")
+    headers.append("ссылка")
+    print("| " + " | ".join(headers) + " |", file=out)
+    print("|" + "|".join(["-----"] * len(headers)) + "|", file=out)
     items.sort(key=lambda x: (x["type"], x["title"].lower()))
     for it in items:
-        print(
-            f"| {it['type']} "
-            f"| {_md_escape(it['title'])} "
-            f"| `{_md_escape(it['username'])}` "
-            f"| `{it['id']}` "
-            f"| {_md_link(it)} |",
-            file=out,
-        )
+        members = it.get("members")
+        members_s = str(members) if members is not None else "—"
+        flags_s = it.get("flags") or "—"
+        cells = [
+            it["type"],
+            _md_escape(it["title"]),
+            f"`{_md_escape(it['username'])}`",
+            f"`{it['id']}`",
+            it.get("created_at") or "—",
+            members_s,
+            flags_s,
+        ]
+        if has_joined:
+            cells.append(it.get("joined_at") or "—")
+        if has_activity:
+            cells.append(it.get("last_message_at") or "—")
+        cells.append(_md_link(it))
+        print("| " + " | ".join(cells) + " |", file=out)
     print(file=out)
 
 
@@ -830,26 +1019,38 @@ def write_md(path: Path, args, current, left, lookup) -> None:
         )
         if lookup is not None:
             print("## Поиск по id\n", file=out)
-            print("| id | тип | название | @username | участников | ссылка | описание |", file=out)
-            print("|----|-----|----------|-----------|------------|--------|----------|", file=out)
+            headers = [
+                "id", "тип", "название", "@username",
+                "создан", "участников", "флаги",
+                "вступил", "посл. сообщ.", "ссылка", "описание",
+            ]
+            print("| " + " | ".join(headers) + " |", file=out)
+            print("|" + "|".join(["----"] * len(headers)) + "|", file=out)
             for it in lookup:
                 if it.get("error"):
                     print(
-                        f"| `{it['id']}` | — | _ОШИБКА_ | — | — | — | "
+                        f"| `{it['id']}` | — | _ОШИБКА_ | — | — | — | — | — | — | — | "
                         f"{_md_escape(it['error'])} |",
                         file=out,
                     )
                     continue
-                parts = (
-                    f"| `{it['id']}` "
-                    f"| {it['type']} "
-                    f"| {_md_escape(it['title'])} "
-                    f"| `{_md_escape(it['username'])}` "
-                    f"| {it.get('participants') if it.get('participants') is not None else '—'} "
-                    f"| {_md_link(it)} "
-                    f"| {_md_escape(it.get('about',''))} |"
-                )
-                print(parts, file=out)
+                participants = it.get("participants")
+                if participants is None:
+                    participants = it.get("members")
+                cells = [
+                    f"`{it['id']}`",
+                    it["type"],
+                    _md_escape(it["title"]),
+                    f"`{_md_escape(it['username'])}`",
+                    it.get("created_at") or "—",
+                    str(participants) if participants is not None else "—",
+                    it.get("flags") or "—",
+                    it.get("joined_at") or "—",
+                    it.get("last_message_at") or "—",
+                    _md_link(it),
+                    _md_escape(it.get("about", "")),
+                ]
+                print("| " + " | ".join(cells) + " |", file=out)
             print(file=out)
             return
         if not args.no_current:
@@ -977,14 +1178,24 @@ def write_xlsx(path: Path, args, current, left, lookup) -> None:
         ws = wb.create_sheet(name)
         items.sort(key=lambda x: (x["type"], x["title"].lower()))
         rows = [
-            [it["type"], it["title"], it["username"], it["id"], it["link"] or ""]
+            [
+                it["type"], it["title"], it["username"], it["id"],
+                it.get("created_at", ""),
+                it.get("members") if it.get("members") is not None else "",
+                it.get("flags", ""),
+                it.get("joined_at", ""),
+                it.get("last_message_at", ""),
+                it["link"] or "",
+            ]
             for it in items
         ]
         _xlsx_write_table(
             ws,
-            ["тип", "название", "@username", "id", "ссылка"],
+            ["тип", "название", "@username", "id",
+             "создан", "участников", "флаги",
+             "вступил", "посл. сообщ.", "ссылка"],
             rows,
-            link_col=5,
+            link_col=10,
         )
 
     if lookup is not None:
@@ -992,19 +1203,31 @@ def write_xlsx(path: Path, args, current, left, lookup) -> None:
         rows = []
         for it in lookup:
             if it.get("error"):
-                rows.append([it["id"], "—", f"ОШИБКА: {it['error']}", "—", "—", "—", "—"])
+                rows.append([
+                    it["id"], "—", f"ОШИБКА: {it['error']}", "—",
+                    "—", "—", "—", "—", "—", "—", "—",
+                ])
                 continue
+            participants = it.get("participants")
+            if participants is None:
+                participants = it.get("members")
             rows.append([
                 it["id"], it["type"], it["title"], it["username"],
-                it.get("participants") if it.get("participants") is not None else "",
+                it.get("created_at", ""),
+                participants if participants is not None else "",
+                it.get("flags", ""),
+                it.get("joined_at", ""),
+                it.get("last_message_at", ""),
                 it["link"] or "",
                 it.get("about", ""),
             ])
         _xlsx_write_table(
             ws,
-            ["id", "тип", "название", "@username", "участников", "ссылка", "описание"],
+            ["id", "тип", "название", "@username",
+             "создан", "участников", "флаги",
+             "вступил", "посл. сообщ.", "ссылка", "описание"],
             rows,
-            link_col=6,
+            link_col=10,
         )
     else:
         if not args.no_current:
@@ -1061,11 +1284,21 @@ async def run(args) -> None:
     try:
         if args.lookup:
             log("→ Режим lookup: ищу по id...")
-            lookup = await lookup_records(client, args.lookup, log)
+            lookup = await lookup_records(
+                client, args.lookup, log,
+                with_joined=args.with_joined,
+                with_activity=args.with_activity,
+            )
         else:
             if not args.no_current:
                 log("→ Загружаю АКТИВНЫЕ подписки...")
                 current = await fetch_current(client, args.type, log)
+                if args.with_joined:
+                    log("→ Дозапрашиваю даты вступления...")
+                    await enrich_joined(client, current, log)
+                if args.with_activity:
+                    log("→ Дозапрашиваю активность (последние сообщения)...")
+                    await enrich_activity(client, current, log)
             if not args.no_left:
                 log("→ Загружаю ПОКИНУТЫЕ каналы через Takeout...")
                 exclude = {r["id"] for r in current}
